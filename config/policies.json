@@ -1,0 +1,54 @@
+{
+  "policies": [
+    {
+      "policy_id": "disk-cleanup-auto",
+      "priority": 100,
+      "description": "主机磁盘满：先写处置标记（安全动作自动执行），再危险动作重启日志服务（需审批）",
+      "match": {"source": "host-a", "alert_type": "disk_full"},
+      "actions": [
+        {
+          "name": "write-marker",
+          "action": "write_file",
+          "params": {"filename": "remediation-marker.txt", "content": "disk cleanup started"},
+          "dangerous": false
+        },
+        {
+          "name": "restart-log-service",
+          "action": "restart_service",
+          "params": {"service": "log-agent"},
+          "dangerous": true,
+          "required_role": "admin"
+        }
+      ]
+    },
+    {
+      "policy_id": "service-restart-approval",
+      "priority": 90,
+      "description": "任意服务不可用：重启服务（危险动作，需管理员审批）",
+      "match": {"alert_type": "service_down"},
+      "actions": [
+        {
+          "name": "restart-service",
+          "action": "restart_service",
+          "params": {"service": "target-service"},
+          "dangerous": true,
+          "required_role": "admin"
+        }
+      ]
+    },
+    {
+      "policy_id": "low-severity-ack",
+      "priority": 10,
+      "description": "低级别告警：仅记录，无需审批",
+      "match": {"alert_type": "noise", "severity_min": "low"},
+      "actions": [
+        {
+          "name": "ack",
+          "action": "noop",
+          "params": {},
+          "dangerous": false
+        }
+      ]
+    }
+  ]
+}
