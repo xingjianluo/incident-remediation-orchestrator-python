@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""根入口：复用 app 包内的 FastAPI 应用，接入既有启动方式。"""
+from app.api import create_app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()

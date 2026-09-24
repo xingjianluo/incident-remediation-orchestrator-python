@@ -1,0 +1,53 @@
+[
+  {
+    "id": "disk-full-restart",
+    "description": "磁盘告警：先清缓存（安全），必要时重启服务（安全，本地模拟）",
+    "match": {
+      "event_type": "disk_full",
+      "source_prefix": "host-",
+      "severities": ["warning", "critical"],
+      "labels": {}
+    },
+    "priority": 100,
+    "actions": [
+      { "name": "clear_disk_cache", "risk": "safe", "required_role": "operator" },
+      { "name": "restart_service", "risk": "safe", "required_role": "operator", "params": {} }
+    ]
+  },
+  {
+    "id": "security-incident-isolate",
+    "description": "安全事件：隔离主机（危险动作，需管理员权限 + 人工审批）",
+    "match": {
+      "event_type": "security_intrusion",
+      "severities": ["critical"],
+      "labels": {}
+    },
+    "priority": 10,
+    "actions": [
+      { "name": "isolate_host", "risk": "dangerous", "required_role": "admin" }
+    ]
+  },
+  {
+    "id": "overload-scale",
+    "description": "负载告警：扩容 worker（安全，可容忍失败继续）",
+    "match": {
+      "event_type": "service_overload",
+      "labels": { "tier": "backend" }
+    },
+    "priority": 50,
+    "actions": [
+      { "name": "scale_workers", "risk": "safe", "required_role": "operator", "continue_on_failure": true, "params": {"count": 2} }
+    ]
+  },
+  {
+    "id": "disk-full-restart-low",
+    "description": "冲突策略：优先级低于 disk-full-restart，用于验证冲突判定",
+    "match": {
+      "event_type": "disk_full"
+    },
+    "priority": 200,
+    "actions": [
+      { "name": "scale_workers", "risk": "safe", "required_role": "operator", "params": {"count": 1} }
+    ]
+  }
+]

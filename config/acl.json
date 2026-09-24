@@ -1,0 +1,12 @@
+{
+  "users": {
+    "alice": "admin",
+    "carol": "operator",
+    "dave": "viewer"
+  },
+  "roles": {
+    "admin": ["operator", "admin", "approve"],
+    "operator": ["operator"],
+    "viewer": ["read"]
+  }
+}
