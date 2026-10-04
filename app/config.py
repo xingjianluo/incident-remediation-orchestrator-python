@@ -18,6 +18,7 @@ class Settings:
     approval_ttl_seconds: int
     execution_timeout_seconds: int
     worker_tick_seconds: float
+    max_attempts: int
 
     @property
     def store_file(self) -> str:
@@ -43,4 +44,5 @@ def get_settings() -> Settings:
         approval_ttl_seconds=int(_env("IRO_APPROVAL_TTL_SECONDS", "600")),
         execution_timeout_seconds=int(_env("IRO_EXECUTION_TIMEOUT_SECONDS", "30")),
         worker_tick_seconds=float(_env("IRO_WORKER_TICK_SECONDS", "0.02")),
+        max_attempts=max(1, int(_env("IRO_MAX_ATTEMPTS", "3"))),
     )

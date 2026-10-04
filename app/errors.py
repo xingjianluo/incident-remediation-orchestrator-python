@@ -29,6 +29,14 @@ class PolicyRejected(OrchestratorError):
     """事件层面的拒绝（非法事件 / 无策略），HTTP 4xx，不产生任何执行。"""
 
 
+class PolicyConflict(PolicyRejected):
+    """多条命中策略在优先级与具体度上完全同级，无法稳定裁决（配置冲突）。
+
+    与其他拒绝明确区分：reason 固定为 policy_conflict，details 中带
+    conflicting_policies，供调用方定位冲突配置。
+    """
+
+
 class AuthorizationError(OrchestratorError):
     """权限/审批边界拒绝，HTTP 403，且不得改变执行状态。"""
 

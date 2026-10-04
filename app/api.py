@@ -96,7 +96,8 @@ def create_app(
         elif isinstance(exc, ExecutionConflict):
             status_code = 404 if exc.reason == RejectReason.EXECUTION_NOT_FOUND else 409
         elif isinstance(exc, PolicyRejected):
-            status_code = 422
+            # 策略之间的配置冲突用 409 与“事件本身无匹配(422)”在 HTTP 层也区分开
+            status_code = 409 if exc.reason == RejectReason.POLICY_CONFLICT else 422
         body = RejectResponse(
             error=exc.message, reason=exc.reason, details=exc.details
         ).model_dump()
@@ -104,6 +105,13 @@ def create_app(
             "request rejected reason=%s details=%s", exc.reason.value, exc.details
         )
         return JSONResponse(status_code=status_code, content=body)
+
+    def _classify_validation_reason(errors: list[dict[str, Any]]) -> RejectReason:
+        # 必填字段缺失（pydantic type=missing）与字段值本身不合法分开；
+        # 请求体非对象 / 非法 JSON 等结构问题仍归为 invalid_event。
+        if any(err.get("type") == "missing" for err in errors):
+            return RejectReason.MISSING_FIELD
+        return RejectReason.INVALID_EVENT
 
     @app.exception_handler(ValidationError)
     async def _on_validation(_: Request, exc: ValidationError) -> JSONResponse:
@@ -119,13 +127,14 @@ def create_app(
             if ctx:
                 item["ctx"] = {k: str(v) for k, v in ctx.items()}
             safe_errors.append(item)
-        # 字段缺失/非法事件不得静默：给出可区分的 invalid_event 拒绝
+        # 字段缺失/非法事件不得静默：按缺失 vs 值非法给出可区分的拒绝原因
+        reason = _classify_validation_reason(safe_errors)
         body = RejectResponse(
             error="event payload failed validation",
-            reason=RejectReason.INVALID_EVENT,
+            reason=reason,
             details={"errors": safe_errors},
         ).model_dump()
-        log.warning("invalid event rejected: %s", safe_errors)
+        log.warning("invalid event rejected reason=%s errors=%s", reason.value, safe_errors)
         return JSONResponse(status_code=422, content=body)
 
     @app.exception_handler(RequestValidationError)
@@ -142,12 +151,14 @@ def create_app(
             if ctx:
                 item["ctx"] = {k: str(v) for k, v in ctx.items()}
             safe_errors.append(item)
+        # 请求体非对象 / 类型错误等框架层校验失败；缺必填与值非法分别归类
+        reason = _classify_validation_reason(safe_errors)
         body = RejectResponse(
             error="event payload failed validation",
-            reason=RejectReason.INVALID_EVENT,
+            reason=reason,
             details={"errors": safe_errors},
         ).model_dump()
-        log.warning("malformed request rejected: %s", safe_errors)
+        log.warning("malformed request rejected reason=%s errors=%s", reason.value, safe_errors)
         return JSONResponse(status_code=422, content=body)
 
     @app.get("/")
@@ -196,7 +207,9 @@ def create_app(
 
     @app.post("/executions/{execution_id}/retry")
     def retry_execution(execution_id: str, req: RetryRequest) -> dict[str, Any]:
-        record = executor.retry(execution_id, req.requested_by)
+        record = executor.retry(
+            execution_id, req.requested_by, confirmed=req.confirmed
+        )
         return record.model_dump(mode="json")
 
     @app.post("/executions/{execution_id}/cancel")

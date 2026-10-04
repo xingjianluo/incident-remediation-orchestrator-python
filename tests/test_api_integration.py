@@ -24,6 +24,7 @@ def _app_settings(tmp: Path) -> Settings:
         approval_ttl_seconds=600,
         execution_timeout_seconds=30,
         worker_tick_seconds=0.01,
+        max_attempts=3,
     )
 
 
@@ -44,6 +45,15 @@ POLICIES = [
         "priority": 10,
         "actions": [
             {"name": "isolate_host", "risk": "dangerous", "required_role": "admin"},
+        ],
+    },
+    {
+        "id": "disk-flaky",
+        "match": {"event_type": "disk_flaky"},
+        "priority": 100,
+        "actions": [
+            {"name": "restart_service", "required_role": "operator",
+             "params": {"fail": True}},
         ],
     },
 ]
@@ -128,6 +138,61 @@ def test_duplicate_event_returns_same_execution_over_http(running_client):
     assert r1["execution"]["id"] == r2["execution"]["id"]
     _wait_state(client, r1["execution"]["id"], "completed")
     assert len(client.get("/executions").json()["executions"]) == 1
+
+
+def test_failure_convergence_and_confirmed_retry_over_http(running_client):
+    """持续失败 -> FAILED -> 显式重试 -> 耗尽终态 -> 未确认拒绝 -> 确认后续跑。"""
+    client, settings = running_client
+    resp = client.post("/events", json={
+        "event_id": "api-e-flaky", "event_type": "disk_flaky",
+        "source": "host-3", "severity": "critical", "submitted_by": "carol",
+    })
+    exec_id = resp.json()["execution"]["id"]
+    _wait_state(client, exec_id, "failed")
+
+    # 第 2 次显式尝试
+    assert client.post(f"/executions/{exec_id}/retry",
+                       json={"requested_by": "carol"}).status_code == 200
+    _wait_state(client, exec_id, "failed")
+    # 第 3 次显式尝试 => 预算耗尽（max_attempts=3）
+    client.post(f"/executions/{exec_id}/retry", json={"requested_by": "carol"})
+    exhausted = _wait_state(client, exec_id, "retry_exhausted")
+    assert exhausted["attempts_used"] == 3
+
+    # 没有人工确认 => 409 + retry_exhausted，状态不变
+    denied = client.post(f"/executions/{exec_id}/retry",
+                         json={"requested_by": "carol"})
+    assert denied.status_code == 409
+    assert denied.json()["reason"] == "retry_exhausted"
+    assert client.get(f"/executions/{exec_id}").json()["state"] == "retry_exhausted"
+
+    # 模拟人为修复：改写策略文件并重启一个新实例读取同一数据目录
+    fixed_policies = [
+        {
+            "id": "disk-flaky",
+            "match": {"event_type": "disk_flaky"},
+            "priority": 100,
+            "actions": [
+                {"name": "restart_service", "required_role": "operator"},
+            ],
+        }
+    ]
+    Path(settings.policy_file).write_text(json.dumps(fixed_policies), encoding="utf-8")
+    # 直接在运行中的 executor 上热替换策略（本地验证场景），确认重试后续跑
+    executor = client.app.state.executor
+    from app.policies import load_policies
+    executor.policies[:] = load_policies(settings.policy_file)
+    confirmed = client.post(f"/executions/{exec_id}/retry",
+                            json={"requested_by": "carol", "confirmed": True})
+    assert confirmed.status_code == 200
+    final = _wait_state(client, exec_id, "completed")
+    assert final["state"] == "completed"
+    # 整个历史只有一次有效副作用
+    effects = Path(settings.data_dir, "effects.jsonl").read_text(
+        encoding="utf-8"
+    ).strip().splitlines()
+    keys = [json.loads(x)["effect_key"] for x in effects]
+    assert keys == [f"{exec_id}:0"]
 
 
 def _effect_path(client) -> str:

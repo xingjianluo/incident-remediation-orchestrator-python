@@ -19,6 +19,7 @@ from app.config import Settings
 from app.errors import (
     AuthorizationError,
     ExecutionConflict,
+    PolicyConflict,
     PolicyRejected,
 )
 from app.policies import match_policy
@@ -119,6 +120,29 @@ class Executor:
             except IndexError:
                 policy = None  # type: ignore[assignment]
                 all_hits = []
+            except PolicyConflict as conflict:
+                # 配置冲突：明确拒绝且不创建任何执行记录，原因与其他拒绝可区分
+                log.warning(
+                    "event_id=%s rejected reason=%s conflicting=%s",
+                    event.event_id,
+                    RejectReason.POLICY_CONFLICT.value,
+                    conflict.details.get("conflicting_policies"),
+                )
+                self.audit.emit(
+                    "event.rejected",
+                    event_id=event.event_id,
+                    actor=event.submitted_by,
+                    reason=RejectReason.POLICY_CONFLICT.value,
+                    details={
+                        "conflicting_policies": conflict.details.get(
+                            "conflicting_policies"
+                        ),
+                        "candidate_policies": conflict.details.get(
+                            "candidate_policies"
+                        ),
+                    },
+                )
+                raise
 
             if policy is None:
                 # 非法/无匹配绝不静默执行：记录拒绝审计，但不创建执行记录
@@ -168,6 +192,8 @@ class Executor:
                 created_at=now,
                 updated_at=now,
                 submitted_by=event.submitted_by,
+                max_attempts=self.settings.max_attempts,
+                attempts_used=0,
             )
             self.store.insert_execution(record)
             self.audit.emit(
@@ -187,6 +213,7 @@ class Executor:
                 record.id,
                 record.state.value,
             )
+            self._wake.set()
             return record, True
 
     # ================= 审批 =================
@@ -274,6 +301,7 @@ class Executor:
                 pending_index,
                 approval.expires_at,
             )
+            self._wake.set()
             return approval
 
     def _first_unapproved_dangerous_index(
@@ -362,25 +390,32 @@ class Executor:
         )
 
     def _pick_runnable_locked(self, now: float) -> ExecutionRecord | None:
-        """选择本轮要推进的执行：崩溃恢复(RUNNING)优先，其次 PENDING/FAILED。"""
-        runnable: list[ExecutionRecord] = []
+        """选择本轮要推进的执行。
+
+        调度公平性边界：
+        - 崩溃恢复（RUNNING）最优先，且仍按创建时间 FIFO；
+        - 其次是 PENDING，按创建时间 FIFO；待审批记录只要审批未补齐就
+          “跳过而非选中后卡住”，因此前面挂着待审批/终态执行不会阻塞
+          后面的普通事件；
+        - FAILED / RETRY_EXHAUSTED 不会被后台自动拾取，只允许显式重试，
+          杜绝一直失败的动作在后台被反复重跑。
+        """
+        recovery: list[ExecutionRecord] = []
+        pending: list[ExecutionRecord] = []
+        approvable: list[ExecutionRecord] = []
         for record in self.store.all_executions():
-            if record.state in (
-                ExecutionState.PENDING,
-                ExecutionState.RUNNING,
-                ExecutionState.FAILED,
-                ExecutionState.AWAITING_APPROVAL,
+            if record.state == ExecutionState.RUNNING:
+                recovery.append(record)
+            elif record.state == ExecutionState.PENDING:
+                pending.append(record)
+            elif (
+                record.state == ExecutionState.AWAITING_APPROVAL
+                # 审批全部有效才可继续；否则跳过，不占用本轮调度位
+                and self._first_unapproved_dangerous_index(record, now) is None
             ):
-                runnable.append(record)
-        # 恢复优先（RUNNING 在前），其余按创建时间稳定排序
-        runnable.sort(
-            key=lambda r: (
-                0 if r.state == ExecutionState.RUNNING else 1,
-                r.created_at,
-                r.id,
-            )
-        )
-        return runnable[0] if runnable else None
+                approvable.append(record)
+        ordered = sorted(recovery + pending + approvable, key=lambda r: (r.created_at, r.id))
+        return ordered[0] if ordered else None
 
     def tick(self) -> bool:
         """推进一次。返回是否处理了某个执行。"""
@@ -394,31 +429,41 @@ class Executor:
                 # 崩溃恢复路径：沿用已有 generation/started_at/deadline
                 gen = record.run_generation
             elif record.state == ExecutionState.AWAITING_APPROVAL:
-                # 审批未补齐则继续挂起；补齐后续跑（首次启动则开启代际与截止时间）
+                # picker 只在审批已补齐时选中它；这里再防御一次：未齐则挂起
                 if self._first_unapproved_dangerous_index(record, now) is not None:
                     return False
                 if record.run_generation == 0:
                     record.run_generation = 1
                     record.started_at = now
                     record.deadline = now + self.settings.execution_timeout_seconds
+                    if record.max_attempts <= 0:  # 兼容旧版本落盘记录
+                        record.max_attempts = self.settings.max_attempts
+                    record.attempts_used = 1
                     record.updated_at = now
                     self.store.save_execution(record)
                 gen = record.run_generation
             else:
+                # PENDING：首次启动或显式重试后续跑。
+                # 首次启动记第 1 次尝试；重试时 attempts_used 已由 retry() 递增。
                 now = self._clock()
                 if record.run_generation == 0:
-                    # 首次启动：开启代际与总截止时间
                     record.run_generation = 1
                     record.started_at = now
                     record.deadline = now + self.settings.execution_timeout_seconds
-                # FAILED 重试后（generation 已保留）直接续跑，不新建代际、不延长截止
+                    if record.max_attempts <= 0:  # 兼容旧版本落盘记录
+                        record.max_attempts = self.settings.max_attempts
+                    record.attempts_used = 1
                 gen = record.run_generation
                 self._transition(
                     record,
                     ExecutionState.RUNNING,
                     kind="run.start",
                     actor=record.submitted_by,
-                    details={"generation": gen},
+                    details={
+                        "generation": gen,
+                        "attempt": record.attempts_used,
+                        "max_attempts": record.max_attempts,
+                    },
                 )
 
         self._run_execution(record.id, gen)
@@ -587,12 +632,34 @@ class Executor:
                     )
                     if action_def.continue_on_failure:
                         continue
-                    self._transition(
-                        record,
-                        ExecutionState.FAILED,
-                        kind="run.failed",
-                        reason=record.error,
-                    )
+                    # 失败收敛：还有尝试预算 => FAILED（确定失败态，等待显式
+                    # 重试，worker 不会自动拾取）；预算耗尽 => RETRY_EXHAUSTED
+                    # 终态，必须经人工 confirmed 后才能再试。两种状态都不会
+                    # 在后台被反复重跑。
+                    if record.attempts_used >= record.max_attempts:
+                        self._transition(
+                            record,
+                            ExecutionState.RETRY_EXHAUSTED,
+                            kind="run.exhausted",
+                            reason=record.error,
+                            details={
+                                "attempts_used": record.attempts_used,
+                                "max_attempts": record.max_attempts,
+                            },
+                        )
+                    else:
+                        self._transition(
+                            record,
+                            ExecutionState.FAILED,
+                            kind="run.failed",
+                            reason=record.error,
+                            details={
+                                "attempts_used": record.attempts_used,
+                                "max_attempts": record.max_attempts,
+                                "retries_left": record.max_attempts
+                                - record.attempts_used,
+                            },
+                        )
                     return
 
                 # 2) 副作用落账（exactly-once 的真相来源）
@@ -648,8 +715,14 @@ class Executor:
                 reason="partial failure" if any_failed else "all steps applied",
             )
 
-    # ================= 显式重试（FAILED 之后） =================
-    def retry(self, execution_id: str, requested_by: str | None) -> ExecutionRecord:
+    # ================= 显式重试（FAILED / RETRY_EXHAUSTED 之后） =================
+    def retry(
+        self,
+        execution_id: str,
+        requested_by: str | None,
+        *,
+        confirmed: bool = False,
+    ) -> ExecutionRecord:
         with self.store.lock:
             record = self.store.get(execution_id)
             if record is None:
@@ -658,14 +731,64 @@ class Executor:
                     "execution not found",
                     {"execution_id": execution_id},
                 )
-            if record.state != ExecutionState.FAILED:
+            if record.state == ExecutionState.RETRY_EXHAUSTED:
+                # 收敛终态：必须有人显式确认，拒绝静默自动/误触发的重跑
+                if not confirmed:
+                    raise ExecutionConflict(
+                        RejectReason.RETRY_EXHAUSTED,
+                        "attempt budget exhausted; human confirmation required",
+                        {
+                            "execution_id": execution_id,
+                            "attempts_used": record.attempts_used,
+                            "max_attempts": record.max_attempts,
+                        },
+                    )
+                record.attempts_used = 1
+                if record.max_attempts <= 0:  # 兼容旧版本落盘记录
+                    record.max_attempts = self.settings.max_attempts
+                self.store.save_execution(record)
+                self.audit.emit(
+                    "retry.confirmed",
+                    execution_id=record.id,
+                    event_id=record.event_id,
+                    actor=requested_by,
+                    reason="human confirmation reopens attempt budget",
+                    details={
+                        "attempts_used": record.attempts_used,
+                        "max_attempts": record.max_attempts,
+                    },
+                )
+                log.warning(
+                    "execution_id=%s manual confirmation by=%s reopens attempt budget",
+                    execution_id,
+                    requested_by,
+                )
+            elif record.state != ExecutionState.FAILED:
                 raise ExecutionConflict(
                     RejectReason.INVALID_STATE_TRANSITION,
                     "only failed executions can be retried",
                     {"execution_id": execution_id, "state": record.state.value},
                 )
-            # 幂等恢复语义：已 APPLIED 的步骤保留，仅失败步骤允许再试；
-            # 失败步骤需重置为 PENDING，效果台账保证不会重复副作用
+            else:
+                # FAILED：仍在预算内（落 FAILED 的前提），消耗下一次尝试
+                if record.max_attempts <= 0:  # 兼容旧版本落盘记录
+                    record.max_attempts = self.settings.max_attempts
+                    record.attempts_used = max(1, record.attempts_used)
+                if record.attempts_used >= record.max_attempts:
+                    raise ExecutionConflict(
+                        RejectReason.RETRY_EXHAUSTED,
+                        "attempt budget exhausted; human confirmation required",
+                        {
+                            "execution_id": execution_id,
+                            "attempts_used": record.attempts_used,
+                            "max_attempts": record.max_attempts,
+                        },
+                    )
+                record.attempts_used += 1
+                self.store.save_execution(record)
+
+            # 幂等恢复语义：已 APPLIED 的步骤保留，仅失败步骤重置为 PENDING；
+            # 效果台账保证已生效的动作绝不会再次执行（只接着没做完的部分走）。
             for step in record.steps:
                 if step.status == StepStatus.FAILED:
                     step.status = StepStatus.PENDING
@@ -677,6 +800,11 @@ class Executor:
                 ExecutionState.PENDING,
                 kind="run.retry",
                 actor=requested_by,
+                details={
+                    "attempt": record.attempts_used,
+                    "max_attempts": record.max_attempts,
+                    "confirmed": confirmed,
+                },
             )
             self._wake.set()
             return record

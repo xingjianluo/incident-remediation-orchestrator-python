@@ -15,6 +15,21 @@
     ]
   },
   {
+    "id": "disk-full-edge-host",
+    "description": "精细规则：边缘关键主机磁盘告警与宽兜底同优先级，但限定了来源/严重度/标签，具体度更高而先命中",
+    "match": {
+      "event_type": "disk_full",
+      "source_prefix": "host-edge-",
+      "severities": ["critical"],
+      "labels": { "tier": "edge" }
+    },
+    "priority": 100,
+    "actions": [
+      { "name": "clear_disk_cache", "risk": "safe", "required_role": "operator" },
+      { "name": "scale_workers", "risk": "safe", "required_role": "operator", "params": {"count": 1} }
+    ]
+  },
+  {
     "id": "security-incident-isolate",
     "description": "安全事件：隔离主机（危险动作，需管理员权限 + 人工审批）",
     "match": {

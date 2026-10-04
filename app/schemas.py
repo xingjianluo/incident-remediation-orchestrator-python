@@ -19,6 +19,7 @@ class ExecutionState(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"                        # 中途失败，可显式重试
     PARTIAL_FAILED = "partial_failed"        # 策略允许继续但部分动作失败（终态）
+    RETRY_EXHAUSTED = "retry_exhausted"      # 失败次数耗尽的收敛终态，需人工确认后再试
     CANCELLED = "cancelled"                  # 终态
     TIMED_OUT = "timed_out"                  # 终态
     REJECTED = "rejected"                    # 终态：策略/事件层面拒绝
@@ -28,6 +29,7 @@ TERMINAL_STATES = frozenset(
     {
         ExecutionState.COMPLETED,
         ExecutionState.PARTIAL_FAILED,
+        ExecutionState.RETRY_EXHAUSTED,
         ExecutionState.CANCELLED,
         ExecutionState.TIMED_OUT,
         ExecutionState.REJECTED,
@@ -36,8 +38,11 @@ TERMINAL_STATES = frozenset(
 
 
 class RejectReason(str, Enum):
-    INVALID_EVENT = "invalid_event"
-    POLICY_NOT_FOUND = "policy_not_found"
+    # 事件层面四类可区分拒绝（需求显式要求调用方可分辨）：
+    INVALID_EVENT = "invalid_event"             # 字段值本身不合法（非法枚举/空串/类型错误）
+    MISSING_FIELD = "missing_field"             # 事件少了必填内容（必填字段缺失/请求体非对象）
+    POLICY_NOT_FOUND = "policy_not_found"       # 事件合法但没有任何策略命中
+    POLICY_CONFLICT = "policy_conflict"         # 命中策略在优先级与具体度上完全同级（配置冲突）
     UNAUTHORIZED = "unauthorized"
     FORBIDDEN = "forbidden"
     APPROVAL_REQUIRED = "approval_required"        # 非拒绝：进入待审批态
@@ -46,6 +51,7 @@ class RejectReason(str, Enum):
     APPROVER_NOT_ALLOWED = "approver_not_allowed"
     EXECUTION_NOT_FOUND = "execution_not_found"
     INVALID_STATE_TRANSITION = "invalid_state_transition"
+    RETRY_EXHAUSTED = "retry_exhausted"            # 重试预算耗尽，未经人工确认不可再试
     ACTION_UNKNOWN = "action_unknown"
 
 
@@ -181,6 +187,10 @@ class ExecutionRecord(BaseModel):
     submitted_by: str | None = None
     error: str | None = None
     run_generation: int = 0  # 每次（含恢复）调度递增，用于识别陈旧执行
+    # 失败收敛：attempts_used 为已消耗的尝试轮次（首次启动记 1），
+    # 达到 max_attempts 后停在 retry_exhausted 终态，等待人工确认重试。
+    attempts_used: int = 0
+    max_attempts: int = 0
 
 
 class ApprovalGrantRequest(BaseModel):
@@ -191,6 +201,9 @@ class ApprovalGrantRequest(BaseModel):
 
 class RetryRequest(BaseModel):
     requested_by: str | None = None
+    # 仅当执行已停在 retry_exhausted 收敛终态时需要：
+    # 显式的人工确认才会重新打开尝试预算，避免后台无限重跑。
+    confirmed: bool = False
 
 
 class CancellationRequest(BaseModel):

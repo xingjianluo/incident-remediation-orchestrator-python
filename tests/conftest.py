@@ -40,6 +40,7 @@ def _settings(tmp: Path) -> Settings:
         approval_ttl_seconds=600,
         execution_timeout_seconds=30,
         worker_tick_seconds=0.005,
+        max_attempts=3,
     )
 
 
