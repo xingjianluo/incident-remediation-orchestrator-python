@@ -18,6 +18,9 @@ class Settings:
     approval_ttl_seconds: int
     execution_timeout_seconds: int
     worker_tick_seconds: float
+    # 单个步骤在一个运行周期内允许的最大自动尝试次数；
+    # 达到上限后执行停在 FAILED，等待人工显式重试
+    max_step_attempts: int = 3
 
     @property
     def store_file(self) -> str:
@@ -43,4 +46,5 @@ def get_settings() -> Settings:
         approval_ttl_seconds=int(_env("IRO_APPROVAL_TTL_SECONDS", "600")),
         execution_timeout_seconds=int(_env("IRO_EXECUTION_TIMEOUT_SECONDS", "30")),
         worker_tick_seconds=float(_env("IRO_WORKER_TICK_SECONDS", "0.02")),
+        max_step_attempts=int(_env("IRO_MAX_STEP_ATTEMPTS", "3")),
     )

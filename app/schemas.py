@@ -36,8 +36,11 @@ TERMINAL_STATES = frozenset(
 
 
 class RejectReason(str, Enum):
-    INVALID_EVENT = "invalid_event"
-    POLICY_NOT_FOUND = "policy_not_found"
+    INVALID_EVENT = "invalid_event"            # 请求体不是合法事件结构（非对象/非JSON）
+    MISSING_FIELD = "missing_field"            # 事件缺少必填内容
+    INVALID_FIELD = "invalid_field"            # 字段值本身不合法
+    POLICY_NOT_FOUND = "policy_not_found"      # 事件合法但无任何策略命中
+    POLICY_CONFLICT = "policy_conflict"        # 优先级与具体程度完全并列，无法稳定裁决
     UNAUTHORIZED = "unauthorized"
     FORBIDDEN = "forbidden"
     APPROVAL_REQUIRED = "approval_required"        # 非拒绝：进入待审批态
@@ -150,7 +153,8 @@ class StepResult(BaseModel):
     effect_key: str | None = None
     result: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
-    attempts: int = 0
+    attempts: int = 0        # 累计执行次数（只增不减，全程可追溯）
+    cycle_attempts: int = 0  # 当前运行周期内的尝试次数；显式重试时归零，重新获得自动重试预算
 
 
 class ApprovalRecord(BaseModel):

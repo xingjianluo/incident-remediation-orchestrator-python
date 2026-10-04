@@ -40,6 +40,9 @@ def _settings(tmp: Path) -> Settings:
         approval_ttl_seconds=600,
         execution_timeout_seconds=30,
         worker_tick_seconds=0.005,
+        # 既有用例的默认语义：失败一次即停在 FAILED，不做自动重试；
+        # 失败收敛用例自行构造更大的预算
+        max_step_attempts=1,
     )
 
 

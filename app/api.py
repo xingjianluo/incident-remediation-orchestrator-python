@@ -44,6 +44,35 @@ from app.storage import Store
 
 log = logging.getLogger("iro.api")
 
+# 请求体整体不是“一个事件”的结构错误（非 JSON、非对象），
+# 与“是事件但字段缺失/值非法”区分开
+_STRUCTURAL_TYPES = {"json_invalid", "model_attributes_type", "model_type"}
+
+
+def _validation_reason(errors: list[dict[str, Any]]) -> RejectReason:
+    types = {str(e.get("type")) for e in errors}
+    if types & _STRUCTURAL_TYPES:
+        return RejectReason.INVALID_EVENT
+    if "missing" in types:
+        return RejectReason.MISSING_FIELD
+    return RejectReason.INVALID_FIELD
+
+
+def _safe_errors(exc: Any) -> list[dict[str, Any]]:
+    # pydantic v2 的 ctx 里可能含异常对象，需转成可序列化字符串
+    safe: list[dict[str, Any]] = []
+    for err in exc.errors():
+        item = {
+            "loc": [str(p) for p in err.get("loc", [])],
+            "type": err.get("type"),
+            "msg": err.get("msg"),
+        }
+        ctx = err.get("ctx")
+        if ctx:
+            item["ctx"] = {k: str(v) for k, v in ctx.items()}
+        safe.append(item)
+    return safe
+
 
 def _load_acl(path: str) -> AclConfig:
     with open(path, "r", encoding="utf-8") as fh:
@@ -107,47 +136,28 @@ def create_app(
 
     @app.exception_handler(ValidationError)
     async def _on_validation(_: Request, exc: ValidationError) -> JSONResponse:
-        # pydantic v2 的 ctx 里可能含异常对象，需转成可序列化字符串
-        safe_errors: list[dict[str, Any]] = []
-        for err in exc.errors():
-            item = {
-                "loc": [str(p) for p in err.get("loc", [])],
-                "type": err.get("type"),
-                "msg": err.get("msg"),
-            }
-            ctx = err.get("ctx")
-            if ctx:
-                item["ctx"] = {k: str(v) for k, v in ctx.items()}
-            safe_errors.append(item)
-        # 字段缺失/非法事件不得静默：给出可区分的 invalid_event 拒绝
+        safe_errors = _safe_errors(exc)
+        reason = _validation_reason(safe_errors)
+        # 字段缺失/值非法不得静默：给出可区分的拒绝原因
         body = RejectResponse(
             error="event payload failed validation",
-            reason=RejectReason.INVALID_EVENT,
+            reason=reason,
             details={"errors": safe_errors},
         ).model_dump()
-        log.warning("invalid event rejected: %s", safe_errors)
+        log.warning("invalid event rejected reason=%s: %s", reason.value, safe_errors)
         return JSONResponse(status_code=422, content=body)
 
     @app.exception_handler(RequestValidationError)
     async def _on_request_validation(_: Request, exc: RequestValidationError) -> JSONResponse:
-        # 请求体非对象 / 类型错误等框架层校验失败，同样给出可区分的 invalid_event
-        safe_errors: list[dict[str, Any]] = []
-        for err in exc.errors():
-            item = {
-                "loc": [str(p) for p in err.get("loc", [])],
-                "type": err.get("type"),
-                "msg": err.get("msg"),
-            }
-            ctx = err.get("ctx")
-            if ctx:
-                item["ctx"] = {k: str(v) for k, v in ctx.items()}
-            safe_errors.append(item)
+        # 请求体非对象 / 类型错误等框架层校验失败，同样给出可区分的拒绝原因
+        safe_errors = _safe_errors(exc)
+        reason = _validation_reason(safe_errors)
         body = RejectResponse(
             error="event payload failed validation",
-            reason=RejectReason.INVALID_EVENT,
+            reason=reason,
             details={"errors": safe_errors},
         ).model_dump()
-        log.warning("malformed request rejected: %s", safe_errors)
+        log.warning("malformed request rejected reason=%s: %s", reason.value, safe_errors)
         return JSONResponse(status_code=422, content=body)
 
     @app.get("/")

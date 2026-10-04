@@ -21,7 +21,7 @@ from app.errors import (
     ExecutionConflict,
     PolicyRejected,
 )
-from app.policies import match_policy
+from app.policies import NoPolicyMatch, PolicyConflict, match_policy
 from app.schemas import (
     TERMINAL_STATES,
     AclConfig,
@@ -116,11 +116,8 @@ class Executor:
 
             try:
                 policy, all_hits = match_policy(event, self.policies)
-            except IndexError:
-                policy = None  # type: ignore[assignment]
-                all_hits = []
-
-            if policy is None:
+            except NoPolicyMatch:
+                policy = None
                 # 非法/无匹配绝不静默执行：记录拒绝审计，但不创建执行记录
                 log.warning(
                     "event_id=%s rejected reason=%s",
@@ -138,6 +135,28 @@ class Executor:
                     "no remediation policy matches the event",
                     {"event_id": event.event_id, "event_type": event.event_type},
                 )
+            except PolicyConflict as exc:
+                # 配置冲突：优先级与具体程度完全并列，无法稳定裁决。
+                # 与无匹配区分开，便于调用方定位是配置问题而非覆盖缺失。
+                log.warning(
+                    "event_id=%s rejected reason=%s tied_policies=%s",
+                    event.event_id,
+                    RejectReason.POLICY_CONFLICT.value,
+                    exc.policy_ids,
+                )
+                self.audit.emit(
+                    "event.rejected",
+                    event_id=event.event_id,
+                    actor=event.submitted_by,
+                    reason=RejectReason.POLICY_CONFLICT.value,
+                    details={"tied_policies": exc.policy_ids},
+                )
+                raise PolicyRejected(
+                    RejectReason.POLICY_CONFLICT,
+                    "top policies tie on priority and specificity; "
+                    "refusing to pick one arbitrarily",
+                    {"event_id": event.event_id, "tied_policies": exc.policy_ids},
+                ) from exc
 
             # 权限预检：任一危险动作越权 => 整体拒绝且不落任何执行状态
             for action in policy.actions:
@@ -362,16 +381,23 @@ class Executor:
         )
 
     def _pick_runnable_locked(self, now: float) -> ExecutionRecord | None:
-        """选择本轮要推进的执行：崩溃恢复(RUNNING)优先，其次 PENDING/FAILED。"""
+        """选择本轮要推进的执行：崩溃恢复(RUNNING)优先，其次按提交顺序的 PENDING。
+
+        公平性约束：
+        - FAILED 是“停机等待人工”的状态，不会被 worker 自动捞起，
+          只能由显式 retry() 重新入队，避免失败动作在后台被反复自动重跑；
+        - 审批未补齐的 AWAITING_APPROVAL 直接跳过（继续挂起），
+          不阻塞队列中后续可推进的普通事件；
+        - 已终态的执行不参与调度。
+        """
         runnable: list[ExecutionRecord] = []
         for record in self.store.all_executions():
-            if record.state in (
-                ExecutionState.PENDING,
-                ExecutionState.RUNNING,
-                ExecutionState.FAILED,
-                ExecutionState.AWAITING_APPROVAL,
-            ):
+            if record.state in (ExecutionState.PENDING, ExecutionState.RUNNING):
                 runnable.append(record)
+            elif record.state == ExecutionState.AWAITING_APPROVAL:
+                if self._first_unapproved_dangerous_index(record, now) is None:
+                    # 审批已补齐，本轮可以继续推进
+                    runnable.append(record)
         # 恢复优先（RUNNING 在前），其余按创建时间稳定排序
         runnable.sort(
             key=lambda r: (
@@ -557,6 +583,7 @@ class Executor:
                     continue
 
                 step.attempts += 1
+                step.cycle_attempts += 1
                 self.store.save_execution(record)
 
                 # 1) 执行本地副作用
@@ -587,11 +614,39 @@ class Executor:
                     )
                     if action_def.continue_on_failure:
                         continue
+                    if step.cycle_attempts < self.settings.max_step_attempts:
+                        # 自动重试预算未用完：回到 PENDING 由 worker 再调度，
+                        # 失败步骤复位为 PENDING（已落账步骤不受影响）
+                        step.status = StepStatus.PENDING
+                        step.error = None
+                        record.error = None
+                        self._transition(
+                            record,
+                            ExecutionState.PENDING,
+                            kind="run.auto_retry",
+                            reason=(
+                                f"step {step.index} failed "
+                                f"({step.cycle_attempts}/{self.settings.max_step_attempts} "
+                                "attempts in cycle); auto-retry scheduled"
+                            ),
+                            details={
+                                "action_index": step.index,
+                                "cycle_attempts": step.cycle_attempts,
+                                "max_step_attempts": self.settings.max_step_attempts,
+                            },
+                        )
+                        return
+                    # 预算耗尽：停在确定的 FAILED 状态，等待人工显式重试，
+                    # worker 不会再自动捞起该执行
                     self._transition(
                         record,
                         ExecutionState.FAILED,
                         kind="run.failed",
-                        reason=record.error,
+                        reason=(
+                            f"{record.error}; auto-retry budget exhausted "
+                            f"({step.cycle_attempts}/{self.settings.max_step_attempts}), "
+                            "parked for manual retry"
+                        ),
                     )
                     return
 
@@ -665,11 +720,14 @@ class Executor:
                     {"execution_id": execution_id, "state": record.state.value},
                 )
             # 幂等恢复语义：已 APPLIED 的步骤保留，仅失败步骤允许再试；
-            # 失败步骤需重置为 PENDING，效果台账保证不会重复副作用
+            # 失败步骤需重置为 PENDING，效果台账保证不会重复副作用。
+            # cycle_attempts 归零：人工确认后重新获得一个完整的自动重试预算；
+            # 累计 attempts 不清零，失败次数全程可追溯。
             for step in record.steps:
                 if step.status == StepStatus.FAILED:
                     step.status = StepStatus.PENDING
                     step.error = None
+                    step.cycle_attempts = 0
             record.error = None
             record.cancel_requested = False
             self._transition(

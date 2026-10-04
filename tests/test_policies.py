@@ -53,24 +53,24 @@ def test_no_matching_policy_is_rejected_not_silent(components):
 
 def test_invalid_event_over_api_returns_distinguishable_reason(client):
     c, _ = client
-    # 缺少必填字段 event_type
+    # 缺少必填字段 event_type -> missing_field（与值非法区分）
     resp = c.post("/events", json={"event_id": "e-bad", "source": "host-1"})
     assert resp.status_code == 422
-    assert resp.json()["reason"] == RejectReason.INVALID_EVENT.value
-    # 非法 severity
+    assert resp.json()["reason"] == RejectReason.MISSING_FIELD.value
+    # 非法 severity -> invalid_field
     resp = c.post("/events", json={
         "event_id": "e-bad2", "event_type": "disk_full",
         "source": "host-1", "severity": "DOOMSDAY",
     })
     assert resp.status_code == 422
-    assert resp.json()["reason"] == RejectReason.INVALID_EVENT.value
-    # 空 event_id
+    assert resp.json()["reason"] == RejectReason.INVALID_FIELD.value
+    # 空 event_id -> invalid_field
     resp = c.post("/events", json={
         "event_id": "  ", "event_type": "disk_full", "source": "host-1",
     })
     assert resp.status_code == 422
-    assert resp.json()["reason"] == RejectReason.INVALID_EVENT.value
-    # 请求体不是 JSON 对象 / 非法 JSON 也不静默
+    assert resp.json()["reason"] == RejectReason.INVALID_FIELD.value
+    # 请求体不是 JSON 对象 / 非法 JSON：结构性错误 -> invalid_event
     resp = c.post("/events", json=["not", "object"])
     assert resp.status_code == 422
     assert resp.json()["reason"] == RejectReason.INVALID_EVENT.value
