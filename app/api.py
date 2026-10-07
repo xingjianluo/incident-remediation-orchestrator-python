@@ -5,7 +5,7 @@
 - GET  /executions/{id}       查询执行状态
 - POST /executions/{id}/approvals  人工授权危险动作
 - POST /executions/{id}/retry      FAILED 后显式重试
-- POST /executions/{id}/cancel     请求取消
+- POST /executions/{id}/cancel     取消（未开始执行/失败停机当场落 cancelled；running/终态 409）
 - GET  /executions                  列出全部执行（调试/验证）
 """
 from __future__ import annotations

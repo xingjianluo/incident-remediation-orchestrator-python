@@ -146,7 +146,11 @@ def test_failed_step_retry_resumes_without_replaying_applied(components):
     assert done.steps[1].attempts == 2
 
 
-def test_cancel_during_recovery_does_not_replay(components):
+def test_cancel_running_execution_rejected_and_recovery_does_not_replay(components):
+    """执行中（含崩溃中断的 RUNNING）取消被拒、状态不变；恢复后不重放副作用。"""
+    from app.errors import ExecutionConflict
+    from app.schemas import RejectReason
+
     settings, _, _, executor, _ = components
     acl = executor.acl
     executor.policies[:] = [CRASH_POLICY]
@@ -159,11 +163,20 @@ def test_cancel_during_recovery_does_not_replay(components):
         pass
 
     ex2, store2, _ = _restart(settings, [RECOVERED_POLICY], acl)
-    # 崩溃后请求取消，再 tick：step0 由台账修复，step1 在动作边界看到取消 -> CANCELLED
-    ex2.request_cancel(rec.id, "carol")
+    # 崩溃中断的执行处于 RUNNING：取消必须被拒，且状态不被改动
+    assert store2.get(rec.id).state == ExecutionState.RUNNING
+    try:
+        ex2.request_cancel(rec.id, "carol")
+        raise AssertionError("expected conflict")
+    except ExecutionConflict as exc:
+        assert exc.reason == RejectReason.INVALID_STATE_TRANSITION
+    assert store2.get(rec.id).state == ExecutionState.RUNNING
+
+    # 恢复续跑：step0 由台账修复不重放，step1 正常执行，最终完成
     ex2.tick()
     final = store2.get(rec.id)
-    assert final.state == ExecutionState.CANCELLED
-    assert final.steps[0].status == StepStatus.APPLIED  # 已应用不回退
-    assert final.steps[1].status == StepStatus.PENDING
-    assert sorted(store2._effects) == [f"{rec.id}:0"]
+    assert final.state == ExecutionState.COMPLETED
+    assert final.steps[0].status == StepStatus.APPLIED
+    assert final.steps[1].status == StepStatus.APPLIED
+    assert sorted(store2._effects) == [f"{rec.id}:0", f"{rec.id}:1"]
+    assert final.steps[0].attempts == 1  # step0 未重新执行

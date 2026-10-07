@@ -144,7 +144,7 @@ curl http://127.0.0.1:8000/health
 | `approver_not_allowed` | 审批人未知或无 approve 能力 | 403 |
 | `approval_expired` | 审批已过期/已消费 | 状态保持，重新挂起 |
 | `execution_not_found` | 执行不存在 | 404 |
-| `invalid_state_transition` | 终态取消/重试、对非待审批执行授权等 | 409 |
+| `invalid_state_transition` | 终态/执行中取消、终态重试、对已取消执行授权等 | 409 |
 | `action_unknown` | 策略引用了未注册动作 | 403 |
 
 四种事件/策略层面拒绝（`missing_field`、`invalid_field`、`policy_not_found`、
@@ -161,11 +161,15 @@ curl http://127.0.0.1:8000/health
      │  ▲                                       │ 审批补齐
      │  │ run.auto_retry（预算内）              ▼
      │  └───────────────────────────────► RUNNING ──┬──► COMPLETED
-     │ run.retry（人工）              ▲   │  │  │  │        ├──► PARTIAL_FAILED（continue_on_failure）
-     │                              │   │  │  │  └────────► CANCELLED（动作边界协作取消）
-   FAILED（预算耗尽，停机待人工）─────┘   │  │  └───────────► TIMED_OUT（总截止时间，终态）
-                                        │  └──────────────► FAILED（自动重试预算耗尽）
-                                        └───────────────── （崩溃后记录留在 RUNNING，重启自动恢复）
+     │ run.retry（人工）              ▲   │  │  │           ├──► PARTIAL_FAILED（continue_on_failure）
+     │                              │   │  │  └──────────► TIMED_OUT（总截止时间，终态）
+   FAILED（预算耗尽，停机待人工）─────┘   │  │  └─────────────► FAILED（自动重试预算耗尽）
+     │                                  │  └──────────────── （崩溃后记录留在 RUNNING，重启自动恢复）
+     └──────────────┬───────────────────┘
+                    │ 取消（PENDING / AWAITING_APPROVAL / FAILED 当场生效；
+                    │       RUNNING 与终态拒绝）
+                    ▼
+                CANCELLED（终态）
 ```
 
 - **幂等**：以 `event_id` 为唯一键。重复/并发提交返回同一条执行记录（响应中 `created=false`），
@@ -175,7 +179,17 @@ curl http://127.0.0.1:8000/health
   恢复时若台账已有该键，则只把步骤修复为 `applied`，**绝不重新调用动作**。
 - **崩溃恢复**：若进程在副作用落账后、步骤提交前崩溃，记录留在 `RUNNING`。
   新进程启动后 worker 优先拾取 `RUNNING` 执行，依据台账补齐状态后续跑剩余动作。
-- **取消**：仅在尚未生效的动作边界生效；已经应用的动作不回滚；终态不可取消。
+- **取消**：尚未开始执行动作的执行（`pending` / `awaiting_approval`），以及失败停机
+  待人工的执行（`failed`），取消**当场生效**：立即落到终态 `cancelled` 并写入
+  `finished_at`，**不需要再有人批准**；接口返回成功时，对外查询到的状态一定已经是
+  `cancelled`，不存在“返回成功却仍挂待审批”的中间态。已应用（`applied`）的步骤
+  照旧保留不回滚，未执行的步骤绝不再执行，此后不再产生任何副作用。
+  `running`（含崩溃中断留下的记录）与终态执行取消一律 409 拒绝，状态与留痕均不变；
+  重复取消因此自然幂等——第二次落在终态上被拒，不重复留痕。
+  **取消与审批并发**：两者在同一进程锁下串行受理，结论唯一——取消先获锁则此后的
+  批准一律 409；批准先获锁但执行尚未启动时，取消仍当场生效，审批单仅作为留痕存在，
+  不会把已取消的执行重新推进。两种顺序的最终状态都是 `cancelled`，
+  状态与审计留痕始终一致，不会出现“显示已取消、之后又被批准执行”。
 - **超时**：以执行**首次启动**时间设定截止时间，重试或恢复不延长、不重置，防止绕过超时；
   超时为终态，已应用步骤保留。
 - **失败收敛（有界自动重试）**：动作失败时，若该步骤本周期尝试次数
@@ -204,7 +218,7 @@ curl http://127.0.0.1:8000/health
 | `GET` | `/executions/{id}` | 查询执行与每步状态 |
 | `POST` | `/executions/{id}/approvals` | 人工授权危险动作 `{"granted_by":"alice","ttl_seconds":600}` |
 | `POST` | `/executions/{id}/retry` | FAILED 后续跑 `{"requested_by":"carol"}` |
-| `POST` | `/executions/{id}/cancel` | 请求取消 `{"requested_by":"carol"}` |
+| `POST` | `/executions/{id}/cancel` | 取消 `{"requested_by":"carol"}`；未开始执行/失败停机当场落 `cancelled`，`running` 与终态 409 |
 | `GET` | `/health` | 健康检查 |
 
 示例：
@@ -246,9 +260,10 @@ curl -X POST http://127.0.0.1:8000/events -H 'Content-Type: application/json' -d
 ## 8. 本地验证（可重复执行）
 
 ```bash
-# 全部 50 个用例：精细匹配与真冲突裁决 / 四类拒绝原因可区分 /
+# 全部 57 个用例：精细匹配与真冲突裁决 / 四类拒绝原因可区分 /
 # 持续失败收敛与显式重试 / 待审批不阻塞普通事件 / 重复+并发提交唯一副作用 /
-# 故障重启 exactly-once / 权限与审批边界 / 取消超时部分失败 / 审计连续性 / 端到端
+# 故障重启 exactly-once / 权限与审批边界 / 取消语义（待审批当场生效、并发结论唯一）/
+# 取消超时部分失败 / 审计连续性 / 端到端
 uv run pytest -q
 
 # 按场景查看覆盖了哪些用例（测试名即场景）
@@ -256,6 +271,7 @@ uv run pytest -v
 uv run pytest tests/test_specificity.py -v         # 精细匹配 / 真冲突 / 顺序无关
 uv run pytest tests/test_failure_convergence.py -v # 有界自动重试 / 停机 / 人工重试
 uv run pytest tests/test_scheduling_fairness.py -v # 调度公平 / 并发重复提交
+uv run pytest tests/test_cancel_semantics.py -v    # 待审批取消当场生效 / 取消与审批并发结论唯一
 
 # 端到端手工验证
 uv run uvicorn app.main:app --port 8000 &
@@ -276,6 +292,11 @@ cat var/data/effects.jsonl   # 副作用台账：每个 effect_key 全局唯一
   再 `POST /executions/{id}/retry` 观察获得新预算并再次收敛。
 - **调度公平**：先提交一个需要审批的 `security_intrusion`（critical）事件，
   再提交普通 `disk_full` 事件，普通事件不等审批即可按序完成。
+- **待审批取消**：提交一个 `security_intrusion`（critical）事件（状态
+  `awaiting_approval`），不审批直接 `POST /executions/{id}/cancel`，
+  响应与再次 `GET /executions/{id}` 都立即显示 `cancelled` 且带 `finished_at`；
+  再 `POST /executions/{id}/approvals` 得到 `409 invalid_state_transition`，
+  `var/data/effects.jsonl` 中不会出现该执行的任何副作用。
 
 测试全部使用临时目录与可控时钟（不访问网络、不使用真实凭据），
 崩溃恢复用例通过动作内的 `crash_after_effect` 注入确定性故障，并以

@@ -310,6 +310,17 @@ class Executor:
     def request_cancel(
         self, execution_id: str, requested_by: str | None
     ) -> ExecutionRecord:
+        """取消语义：
+
+        - PENDING / AWAITING_APPROVAL（尚未开始执行动作）：取消当场生效，
+          立即落到终态 CANCELLED 并写入 finished_at，无需任何审批；
+          已应用的步骤保持 APPLIED 不回滚，未执行的步骤绝不再执行。
+        - RUNNING / 终态：拒绝（409），状态与留痕均不变；
+          重复取消因此自然幂等——第二次落在终态上被拒，不重复留痕。
+        - 与审批并发：两者都在 store.lock 下串行受理。取消先落锁则此后的
+          批准一律 409；批准先落锁但执行尚未启动时，取消仍当场生效，
+          审批单仅作为留痕存在，不再产生任何副作用。
+        """
         with self.store.lock:
             record = self.store.get(execution_id)
             if record is None:
@@ -324,22 +335,35 @@ class Executor:
                     "terminal execution cannot be cancelled",
                     {"execution_id": execution_id, "state": record.state.value},
                 )
+            if record.state == ExecutionState.RUNNING:
+                # 已在执行：拒绝取消，状态不被改动
+                raise ExecutionConflict(
+                    RejectReason.INVALID_STATE_TRANSITION,
+                    "running execution cannot be cancelled",
+                    {"execution_id": execution_id, "state": record.state.value},
+                )
             record.cancel_requested = True
             record.cancel_requested_by = requested_by
-            record.updated_at = self._clock()
-            self.store.save_execution(record)
             self.audit.emit(
                 "cancel.requested",
                 execution_id=execution_id,
                 event_id=record.event_id,
                 actor=requested_by,
                 from_state=record.state.value,
-                to_state=record.state.value,
+                to_state=ExecutionState.CANCELLED.value,
             )
             log.info(
-                "execution_id=%s cancel requested by=%s",
+                "execution_id=%s cancel requested by=%s state=%s -> cancelled immediately",
                 execution_id,
                 requested_by,
+                record.state.value,
+            )
+            self._transition(
+                record,
+                ExecutionState.CANCELLED,
+                kind="run.cancelled",
+                actor=requested_by,
+                reason="cancel requested before any pending step executed",
             )
             return record
 
