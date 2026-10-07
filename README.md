@@ -29,7 +29,7 @@ app/
 config/
   policies.json         # 默认策略配置（含同优先级精细规则示例）
   acl.json              # 用户-角色-能力模型
-tests/                  # 50 个 pytest 用例（精细匹配/冲突裁决/失败收敛/调度公平/并发幂等/崩溃恢复/权限审批/审计/端到端）
+tests/                  # 58 个 pytest 用例（精细匹配/冲突裁决/失败收敛/调度公平/并发幂等/崩溃恢复/权限审批/取消语义与并发裁决/审计/端到端）
 ```
 
 ---
@@ -144,7 +144,7 @@ curl http://127.0.0.1:8000/health
 | `approver_not_allowed` | 审批人未知或无 approve 能力 | 403 |
 | `approval_expired` | 审批已过期/已消费 | 状态保持，重新挂起 |
 | `execution_not_found` | 执行不存在 | 404 |
-| `invalid_state_transition` | 终态取消/重试、对非待审批执行授权等 | 409 |
+| `invalid_state_transition` | 终态取消/重试、对非待审批执行授权（含已取消后再批准）、审批已补齐后取消等 | 409 |
 | `action_unknown` | 策略引用了未注册动作 | 403 |
 
 四种事件/策略层面拒绝（`missing_field`、`invalid_field`、`policy_not_found`、
@@ -158,14 +158,14 @@ curl http://127.0.0.1:8000/health
 ```
                          危险动作且待审批
    PENDING ───────────────────────────────► AWAITING_APPROVAL
-     │  ▲                                       │ 审批补齐
-     │  │ run.auto_retry（预算内）              ▼
-     │  └───────────────────────────────► RUNNING ──┬──► COMPLETED
-     │ run.retry（人工）              ▲   │  │  │  │        ├──► PARTIAL_FAILED（continue_on_failure）
-     │                              │   │  │  │  └────────► CANCELLED（动作边界协作取消）
-   FAILED（预算耗尽，停机待人工）─────┘   │  │  └───────────► TIMED_OUT（总截止时间，终态）
-                                        │  └──────────────► FAILED（自动重试预算耗尽）
-                                        └───────────────── （崩溃后记录留在 RUNNING，重启自动恢复）
+     │  ▲                                  │  │ 审批补齐
+     │  │ run.auto_retry（预算内）         │  ▼
+     │  │                    ┌────────────┴── RUNNING ──┬──► COMPLETED
+     │  └────────────────────┤ 取消当场生效             ├──► PARTIAL_FAILED（continue_on_failure）
+     │ run.retry（人工）     ▼                          ├──► CANCELLED（动作边界协作取消）
+     │                 CANCELLED（无需再审批，终态）     ├──► TIMED_OUT（总截止时间，终态）
+   FAILED（预算耗尽，停机待人工）                       └──► FAILED（自动重试预算耗尽）
+                                        （崩溃后记录留在 RUNNING，重启自动恢复）
 ```
 
 - **幂等**：以 `event_id` 为唯一键。重复/并发提交返回同一条执行记录（响应中 `created=false`），
@@ -175,7 +175,30 @@ curl http://127.0.0.1:8000/health
   恢复时若台账已有该键，则只把步骤修复为 `applied`，**绝不重新调用动作**。
 - **崩溃恢复**：若进程在副作用落账后、步骤提交前崩溃，记录留在 `RUNNING`。
   新进程启动后 worker 优先拾取 `RUNNING` 执行，依据台账补齐状态后续跑剩余动作。
-- **取消**：仅在尚未生效的动作边界生效；已经应用的动作不回滚；终态不可取消。
+- **取消**：
+  - **待审批处置（`awaiting_approval`）取消当场生效**：危险动作一个都还没执行，
+    发起 `cancel` 后记录**立即落到 `cancelled` 终态**（带 `finished_at`），
+    **无需再等任何人审批**。取消之后任何 `approvals` 请求都以
+    `409 invalid_state_transition` 拒绝，worker 不会再推进它，也不会产生任何副作用。
+  - **尚未起跑的普通处置（`pending`）**同样立即取消为终态。
+  - **失败停机（`failed`，等待人工显式重试）**：worker 本就不会自动捞起它，
+    取消同样**立即落到 `cancelled` 终态**（之后 retry 以 409 拒绝）；
+    此前已 `applied` 的步骤保留不回滚。
+  - **执行中（`running`）**：取消请求被记录，在“尚未生效”的动作边界协作收敛为
+    `cancelled`；**已经应用成功的动作不回滚**（审计 `cancel.requested` +
+    下一边界的 `run.cancelled`）。
+  - **已结束**（`completed`/`partial_failed`/`failed`/`timed_out`/`rejected`）：
+    取消一律以 `409 invalid_state_transition` 拒绝，**拒绝时状态与任何字段都不改动、不留取消痕迹**。
+  - **重复取消幂等**：对已是 `cancelled` 的处置再次取消，直接返回同一条终态记录，
+    不重写状态、不重复留痕（不会出现多条 `cancel.requested` / `run.cancelled`）。
+  - 取消结论在 `GET /executions/{id}` 与审计日志中均可见，不存在“接口返回取消成功、
+    对外却仍是待审批”的矛盾。
+- **取消与审批并发的确定结论**：取消与审批在同一把存储锁下串行裁决，最终只有一个结论：
+  - **取消先生效**（审批仍未补齐）：记录立即 `cancelled`，之后到达的批准一律 409，
+    绝不出现“显示已取消、之后又被批准执行”。
+  - **审批先生效**（取消到达时危险动作审批已补齐、随时可起跑）：取消以 409 被拒且
+    状态保持 `awaiting_approval`，处置按原计划在下一拍执行；不会两边各生效一半。
+  - 裁决点即锁获取点，状态迁移与审计留痕在同一临界区内完成，状态与留痕始终一致。
 - **超时**：以执行**首次启动**时间设定截止时间，重试或恢复不延长、不重置，防止绕过超时；
   超时为终态，已应用步骤保留。
 - **失败收敛（有界自动重试）**：动作失败时，若该步骤本周期尝试次数
@@ -204,7 +227,7 @@ curl http://127.0.0.1:8000/health
 | `GET` | `/executions/{id}` | 查询执行与每步状态 |
 | `POST` | `/executions/{id}/approvals` | 人工授权危险动作 `{"granted_by":"alice","ttl_seconds":600}` |
 | `POST` | `/executions/{id}/retry` | FAILED 后续跑 `{"requested_by":"carol"}` |
-| `POST` | `/executions/{id}/cancel` | 请求取消 `{"requested_by":"carol"}` |
+| `POST` | `/executions/{id}/cancel` | 请求取消 `{"requested_by":"carol"}`；待审批/待起跑立即 `cancelled`，终态 409，已取消重复请求幂等 |
 | `GET` | `/health` | 健康检查 |
 
 示例：
@@ -246,16 +269,19 @@ curl -X POST http://127.0.0.1:8000/events -H 'Content-Type: application/json' -d
 ## 8. 本地验证（可重复执行）
 
 ```bash
-# 全部 50 个用例：精细匹配与真冲突裁决 / 四类拒绝原因可区分 /
+# 全部 58 个用例：精细匹配与真冲突裁决 / 四类拒绝原因可区分 /
 # 持续失败收敛与显式重试 / 待审批不阻塞普通事件 / 重复+并发提交唯一副作用 /
-# 故障重启 exactly-once / 权限与审批边界 / 取消超时部分失败 / 审计连续性 / 端到端
+# 故障重启 exactly-once / 权限与审批边界 /
+# 待审批取消立即终态 + 取消/审批并发唯一结论 / 取消超时部分失败 /
+# 审计连续性 / 端到端
 uv run pytest -q
 
 # 按场景查看覆盖了哪些用例（测试名即场景）
-uv run pytest -v
-uv run pytest tests/test_specificity.py -v         # 精细匹配 / 真冲突 / 顺序无关
-uv run pytest tests/test_failure_convergence.py -v # 有界自动重试 / 停机 / 人工重试
-uv run pytest tests/test_scheduling_fairness.py -v # 调度公平 / 并发重复提交
+uv run pytest -o addopts="" -v
+uv run pytest tests/test_specificity.py -o addopts="" -v         # 精细匹配 / 真冲突 / 顺序无关
+uv run pytest tests/test_failure_convergence.py -o addopts="" -v # 有界自动重试 / 停机 / 人工重试
+uv run pytest tests/test_scheduling_fairness.py -o addopts="" -v # 调度公平 / 并发重复提交
+uv run pytest tests/test_cancel_semantics.py -o addopts="" -v    # 取消语义 / 取消与审批并发
 
 # 端到端手工验证
 uv run uvicorn app.main:app --port 8000 &
@@ -276,6 +302,17 @@ cat var/data/effects.jsonl   # 副作用台账：每个 effect_key 全局唯一
   再 `POST /executions/{id}/retry` 观察获得新预算并再次收敛。
 - **调度公平**：先提交一个需要审批的 `security_intrusion`（critical）事件，
   再提交普通 `disk_full` 事件，普通事件不等审批即可按序完成。
+- **待审批取消立即生效**：提交一个需要审批的 `security_intrusion`（critical）事件，
+  在**不做任何审批**的情况下直接 `POST /executions/{id}/cancel`，响应体中
+  `state` 当场就是 `cancelled` 且带 `finished_at`；再调
+  `POST /executions/{id}/approvals` 得到 `409 invalid_state_transition`；
+  `effects.jsonl` 中不出现该执行的任何 `effect_key`。重复调用 cancel 返回同一条记录，
+  `audit.log` 中只有一条 `cancel.requested` 和一条 `run.cancelled`。
+- **取消与审批并发**：自动化用例
+  `test_concurrent_cancel_and_approval_has_single_outcome` 用 60 轮真实双线程
+  （主线程一次性放行）稳定复现两种裁决：取消先拿锁则 `cancelled` 且零副作用，
+  审批先补齐则取消 409、随后正常 `completed`，并断言两种裁决都真实发生过、
+  每轮状态与留痕一致。
 
 测试全部使用临时目录与可控时钟（不访问网络、不使用真实凭据），
 崩溃恢复用例通过动作内的 `crash_after_effect` 注入确定性故障，并以

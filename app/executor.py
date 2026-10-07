@@ -318,15 +318,86 @@ class Executor:
                     "execution not found",
                     {"execution_id": execution_id},
                 )
+            # 重复取消幂等：已在终态 CANCELLED 上再次请求直接返回既有记录，
+            # 不改状态、不重复留痕
+            if record.state == ExecutionState.CANCELLED:
+                log.info(
+                    "execution_id=%s duplicate cancel ignored (already cancelled)",
+                    execution_id,
+                )
+                return record
+            # 其它终态（completed/partial_failed/timed_out/rejected）
+            # 拒绝取消且不改动任何状态
             if record.state in TERMINAL_STATES:
                 raise ExecutionConflict(
                     RejectReason.INVALID_STATE_TRANSITION,
                     "terminal execution cannot be cancelled",
                     {"execution_id": execution_id, "state": record.state.value},
                 )
+            # 执行中重复请求取消：标记已在，幂等返回，不重复留痕
+            if record.cancel_requested:
+                log.info(
+                    "execution_id=%s duplicate cancel ignored (already requested)",
+                    execution_id,
+                )
+                return record
+            now = self._clock()
+            if record.state in (
+                ExecutionState.AWAITING_APPROVAL,
+                ExecutionState.PENDING,
+                ExecutionState.FAILED,
+            ):
+                # 尚未真正生效（危险动作一个都没执行，普通执行也还没起跑），
+                # 或停在 FAILED 等待人工重试（不会再有自动副作用）：
+                # 取消当场生效，立即落到 CANCELLED 终态，无需再等审批；
+                # 已 APPLIED 的步骤保留不回滚。
+                # 但“审批已补齐、随时可起跑”的待审批执行视为审批先生效，
+                # 取消被拒绝且状态保持原样（由调用方在下一拍按原计划执行）。
+                if (
+                    record.state == ExecutionState.AWAITING_APPROVAL
+                    and self._first_unapproved_dangerous_index(record, now) is None
+                ):
+                    raise ExecutionConflict(
+                        RejectReason.INVALID_STATE_TRANSITION,
+                        "approval already completed; execution proceeds and "
+                        "cannot be cancelled before start",
+                        {
+                            "execution_id": execution_id,
+                            "state": record.state.value,
+                        },
+                    )
+                record.cancel_requested = True
+                record.cancel_requested_by = requested_by
+                record.updated_at = now
+                self.audit.emit(
+                    "cancel.requested",
+                    execution_id=execution_id,
+                    event_id=record.event_id,
+                    actor=requested_by,
+                    from_state=record.state.value,
+                    to_state=record.state.value,
+                )
+                self._transition(
+                    record,
+                    ExecutionState.CANCELLED,
+                    kind="run.cancelled",
+                    actor=requested_by,
+                    reason="cancelled before any further action could take effect",
+                )
+                self._wake.set()
+                log.info(
+                    "execution_id=%s cancel effective immediately by=%s "
+                    "(no action executed)",
+                    execution_id,
+                    requested_by,
+                )
+                return record
+
+            # RUNNING：取消标记在“尚未生效”的动作边界协作收敛；
+            # 已成功应用的动作不回滚（详见 _run_execution）。
             record.cancel_requested = True
             record.cancel_requested_by = requested_by
-            record.updated_at = self._clock()
+            record.updated_at = now
             self.store.save_execution(record)
             self.audit.emit(
                 "cancel.requested",
@@ -337,10 +408,11 @@ class Executor:
                 to_state=record.state.value,
             )
             log.info(
-                "execution_id=%s cancel requested by=%s",
+                "execution_id=%s cancel requested by=%s (cooperative at step boundary)",
                 execution_id,
                 requested_by,
             )
+            self._wake.set()
             return record
 
     # ================= 调度与执行 =================
@@ -486,10 +558,18 @@ class Executor:
             # 以落盘的最新代际为准；存在更新代际时本次陈旧调用退出
             if record.run_generation != generation:
                 return
+            # 二次拿锁后可能已被并发取消（尤其待审批执行：取消当场落 CANCELLED）。
+            # 已终态立即退出，绝不产生任何副作用。
+            if record.state in TERMINAL_STATES:
+                return
             policy = next(p for p in self.policies if p.id == record.policy_id)
 
             # 待审批执行在 worker 接手时：审批齐全则继续，仍缺失则挂起
             if record.state == ExecutionState.AWAITING_APPROVAL:
+                if record.cancel_requested:
+                    # 取消已在 request_cancel 内当场生效为终态，
+                    # 兜底：标记仍在但状态异常时不推进
+                    return
                 if self._first_unapproved_dangerous_index(record, self._clock()) is not None:
                     return
                 record.state = ExecutionState.RUNNING
